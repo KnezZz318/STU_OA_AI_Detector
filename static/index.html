@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>STU-OA 智能监控</title>
+  <style>
+    body { font-family: "Helvetica Neue", Arial, sans-serif; margin: 24px; }
+    .status { padding: 12px; background: #f5f7fb; border-radius: 8px; margin-bottom: 16px; }
+    .row { margin-bottom: 12px; }
+    textarea { width: 100%; height: 240px; }
+    button { padding: 8px 12px; }
+    #otp-section { display: none; }
+  </style>
+</head>
+<body>
+  <h1>STU-OA 智能监控与 AI 简报</h1>
+  <div class="status" id="status">等待任务启动</div>
+
+  <div class="row">
+    <label>账号：<input id="username" type="text" placeholder="可选" /></label>
+    <label style="margin-left: 8px;">密码：<input id="password" type="password" placeholder="可选" /></label>
+    <button id="start">开始获取简报</button>
+  </div>
+
+  <div class="row" id="otp-section">
+    <label>动态口令：<input id="otp" type="text" /></label>
+    <button id="send-otp">提交口令</button>
+  </div>
+
+  <div class="row">
+    <textarea id="result" placeholder="结果将在此显示" readonly></textarea>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const otpSection = document.getElementById("otp-section");
+
+    async function fetchStatus() {
+      const res = await fetch("/api/status");
+      const data = await res.json();
+      statusEl.textContent = data.msg;
+      otpSection.style.display = data.status === "waiting_otp" ? "block" : "none";
+      if (data.status === "done") {
+        const resultRes = await fetch("/api/result");
+        if (resultRes.ok) {
+          const result = await resultRes.json();
+          resultEl.value = result.markdown;
+        }
+      }
+    }
+
+    document.getElementById("start").addEventListener("click", async () => {
+      resultEl.value = "";
+      const payload = {
+        username: document.getElementById("username").value || null,
+        password: document.getElementById("password").value || null,
+      };
+      const res = await fetch("/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        statusEl.textContent = err.detail || "启动失败";
+        return;
+      }
+      fetchStatus();
+    });
+
+    document.getElementById("send-otp").addEventListener("click", async () => {
+      const otp = document.getElementById("otp").value;
+      const res = await fetch("/api/otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ otp }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        statusEl.textContent = err.detail || "口令提交失败";
+      }
+      fetchStatus();
+    });
+
+    setInterval(fetchStatus, 1500);
+  </script>
+</body>
+</html>
