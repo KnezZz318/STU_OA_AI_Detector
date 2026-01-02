@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 class StartRequest(BaseModel):
     username: str = Field(..., min_length=1)
     password: str = Field(..., min_length=1)
+    username: Optional[str] = None
+    password: Optional[str] = None
 
 
 class OtpRequest(BaseModel):
@@ -100,6 +102,11 @@ async def run_job(payload: StartRequest) -> None:
             state.update("done", "简报已生成")
             await context.close()
             await browser.close()
+        await simulate_login(payload)
+        notices = await simulate_scrape()
+        state.update("processing", "正在调用 AI 摘要...")
+        state.result_markdown = await simulate_ai_summary(notices)
+        state.update("done", "简报已生成")
     except Exception as exc:  # pragma: no cover - generic fallback
         state.update("error", f"任务失败: {exc}")
 
@@ -216,6 +223,26 @@ async def scrape_notices(page: Any) -> List[Dict[str, Any]]:
     if not items:
         raise RuntimeError("未抓取到任何通知，请检查选择器配置")
     return items
+async def simulate_login(payload: StartRequest) -> None:
+    state.update("processing", "正在登录 WebVPN...")
+    await asyncio.sleep(0.2)
+
+    require_otp = os.getenv("REQUIRE_OTP", "1") == "1"
+    if require_otp:
+        state.update("waiting_otp", "等待动态口令输入...")
+        try:
+            await asyncio.wait_for(state.otp_event.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            state.update("error", "动态口令超时")
+            raise
+
+    state.update("processing", "登录成功，准备进入 OA...")
+    await asyncio.sleep(0.2)
+
+
+async def simulate_scrape() -> List[Dict[str, Any]]:
+    state.update("processing", "正在抓取通知列表...")
+    await asyncio.sleep(0.2)
 
     now = datetime.utcnow().date()
     sample_items = [

@@ -32,3 +32,5 @@ uvicorn app.main:app --reload
 - `OA_DATE_SELECTOR`：日期选择器（相对列表行）。
 - `OA_LINK_SELECTOR`：详情链接选择器（相对列表行）。
 - `OA_DETAIL_CONTENT_SELECTOR`：详情页正文选择器。
+- `REQUIRE_OTP=1`：需要动态口令（默认）。
+- `REQUIRE_OTP=0`：跳过动态口令流程。
