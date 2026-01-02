@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +16,8 @@ from pydantic import BaseModel, Field
 
 
 class StartRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
     username: Optional[str] = None
     password: Optional[str] = None
 
@@ -86,6 +91,17 @@ async def get_result() -> Dict[str, str]:
 
 async def run_job(payload: StartRequest) -> None:
     try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            await login_and_enter_oa(page, payload)
+            notices = await scrape_notices(page)
+            state.update("processing", "正在调用 AI 摘要...")
+            state.result_markdown = await simulate_ai_summary(notices)
+            state.update("done", "简报已生成")
+            await context.close()
+            await browser.close()
         await simulate_login(payload)
         notices = await simulate_scrape()
         state.update("processing", "正在调用 AI 摘要...")
@@ -95,6 +111,118 @@ async def run_job(payload: StartRequest) -> None:
         state.update("error", f"任务失败: {exc}")
 
 
+def get_env(name: str, default: Optional[str] = None) -> str:
+    value = os.getenv(name, default)
+    if value is None:
+        raise RuntimeError(f"缺少环境变量: {name}")
+    return value
+
+
+async def login_and_enter_oa(page: Any, payload: StartRequest) -> None:
+    state.update("processing", "正在登录 WebVPN...")
+
+    login_url = get_env("WEBVPN_LOGIN_URL")
+    username_selector = get_env("WEBVPN_USERNAME_SELECTOR")
+    password_selector = get_env("WEBVPN_PASSWORD_SELECTOR")
+    submit_selector = get_env("WEBVPN_SUBMIT_SELECTOR")
+    otp_dialog_selector = get_env("WEBVPN_OTP_DIALOG_SELECTOR")
+    otp_input_selector = get_env("WEBVPN_OTP_INPUT_SELECTOR")
+    otp_submit_selector = get_env("WEBVPN_OTP_SUBMIT_SELECTOR")
+    oa_entry_url = get_env("OA_ENTRY_URL")
+    oa_ready_selector = get_env("OA_READY_SELECTOR")
+
+    await page.goto(login_url, wait_until="domcontentloaded")
+    await page.fill(username_selector, payload.username)
+    await page.fill(password_selector, payload.password)
+    await page.click(submit_selector)
+
+    try:
+        await page.wait_for_selector(otp_dialog_selector, timeout=8000)
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError("未检测到口令输入窗口，请检查选择器") from exc
+
+    state.update("waiting_otp", "等待动态口令输入...")
+    try:
+        await asyncio.wait_for(state.otp_event.wait(), timeout=60)
+    except asyncio.TimeoutError as exc:
+        state.update("error", "动态口令超时")
+        raise exc
+
+    await page.fill(otp_input_selector, state.otp_value or "")
+    await page.click(otp_submit_selector)
+
+    state.update("processing", "正在进入 OA 系统...")
+    await page.goto(oa_entry_url, wait_until="domcontentloaded")
+    try:
+        await page.wait_for_selector(oa_ready_selector, timeout=15000)
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError("OA 页面未加载成功，请检查入口地址或选择器") from exc
+
+
+async def scrape_notices(page: Any) -> List[Dict[str, Any]]:
+    state.update("processing", "正在抓取通知列表...")
+    list_row_selector = get_env("OA_LIST_ROW_SELECTOR")
+    title_selector = get_env("OA_TITLE_SELECTOR")
+    department_selector = get_env("OA_DEPARTMENT_SELECTOR")
+    date_selector = get_env("OA_DATE_SELECTOR")
+    link_selector = get_env("OA_LINK_SELECTOR")
+    detail_content_selector = get_env("OA_DETAIL_CONTENT_SELECTOR")
+
+    await page.wait_for_selector(list_row_selector, timeout=15000)
+    rows = await page.query_selector_all(list_row_selector)
+    cutoff_date = datetime.utcnow().date() - timedelta(days=30)
+
+    metadata: List[Dict[str, Any]] = []
+    for row in rows:
+        title_el = await row.query_selector(title_selector)
+        department_el = await row.query_selector(department_selector)
+        date_el = await row.query_selector(date_selector)
+        link_el = await row.query_selector(link_selector)
+        if not all([title_el, department_el, date_el, link_el]):
+            raise RuntimeError("通知列表选择器不完整，请检查配置")
+
+        title = (await title_el.inner_text()).strip()
+        department = (await department_el.inner_text()).strip()
+        date_text = (await date_el.inner_text()).strip()
+        link = await link_el.get_attribute("href")
+        if not link:
+            continue
+
+        try:
+            parsed_date = datetime.fromisoformat(date_text).date()
+        except ValueError:
+            parsed_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+
+        if parsed_date < cutoff_date:
+            break
+
+        metadata.append(
+            {
+                "title": title,
+                "department": department,
+                "date": parsed_date,
+                "link": link,
+            }
+        )
+
+    items: List[Dict[str, Any]] = []
+    for entry in metadata:
+        await page.goto(entry["link"], wait_until="domcontentloaded")
+        await page.wait_for_selector(detail_content_selector, timeout=15000)
+        content = await page.inner_text(detail_content_selector)
+        items.append(
+            {
+                "title": entry["title"],
+                "department": entry["department"],
+                "date": str(entry["date"]),
+                "content": " ".join(content.split()),
+            }
+        )
+        state.update("processing", f"已读取 {len(items)} 条通知详情...")
+
+    if not items:
+        raise RuntimeError("未抓取到任何通知，请检查选择器配置")
+    return items
 async def simulate_login(payload: StartRequest) -> None:
     state.update("processing", "正在登录 WebVPN...")
     await asyncio.sleep(0.2)
